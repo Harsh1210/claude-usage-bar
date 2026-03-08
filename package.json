@@ -1,0 +1,54 @@
+{
+  "name": "claude-usage-bar",
+  "displayName": "Claude Usage Bar",
+  "description": "Shows your Claude Code rate limit usage in the VS Code status bar — session %, reset countdown, and color alerts. Zero token cost.",
+  "version": "0.1.0",
+  "publisher": "HarshAgarwal1012",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HarshAgarwal1012/claude-usage-bar"
+  },
+  "homepage": "https://github.com/HarshAgarwal1012/claude-usage-bar",
+  "bugs": {
+    "url": "https://github.com/HarshAgarwal1012/claude-usage-bar/issues"
+  },
+  "license": "MIT",
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "keywords": ["claude", "anthropic", "rate limit", "usage", "status bar", "claude code", "ai"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeUsageBar.refresh",
+        "title": "Claude Usage: Refresh"
+      },
+      {
+        "command": "claudeUsageBar.showDetails",
+        "title": "Claude Usage: Show Session Details"
+      },
+      {
+        "command": "claudeUsageBar.refreshRateLimit",
+        "title": "Claude Usage: Refresh Rate Limit"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package --no-dependencies",
+    "publish": "npx @vscode/vsce publish --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}
