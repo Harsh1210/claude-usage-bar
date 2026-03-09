@@ -1,7 +1,6 @@
 import * as vscode from "vscode";
 import * as os from "os";
 import * as https from "https";
-import * as http from "http";
 import { execSync } from "child_process";
 
 interface RateLimitEntry {
@@ -23,8 +22,6 @@ interface RateLimitInfo {
 
 const KEYCHAIN_SERVICE = "Claude Code-credentials";
 const ANTHROPIC_BETA = "oauth-2025-04-20";
-const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
-const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 let rateLimitBarItem: vscode.StatusBarItem;
 let rateLimitPollInterval: ReturnType<typeof setInterval> | undefined;
@@ -79,47 +76,6 @@ function readKeychain(): { accessToken: string; refreshToken: string } | undefin
   return undefined;
 }
 
-// ── Token Refresh ────────────────────────────────────────────────
-
-function refreshToken(refreshTok: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const body = new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshTok,
-      client_id: CLIENT_ID,
-    }).toString();
-
-    const url = new URL(TOKEN_URL);
-    const options: https.RequestOptions = {
-      hostname: url.hostname,
-      path: url.pathname,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Content-Length": Buffer.byteLength(body),
-      },
-      timeout: 10000,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = "";
-      res.on("data", (c) => (data += c));
-      res.on("end", () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.access_token) resolve(parsed.access_token);
-          else reject(new Error(`No access_token in response: ${data}`));
-        } catch (e) {
-          reject(e);
-        }
-      });
-    });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
-    req.write(body);
-    req.end();
-  });
-}
 
 // ── Fetch Usage ──────────────────────────────────────────────────
 
@@ -163,18 +119,13 @@ async function fetchRateLimit() {
       return;
     }
 
-    // Try with current token, refresh if 401/429
-    let { status, body } = await httpGet(creds.accessToken);
+    const { status, body } = await httpGet(creds.accessToken);
 
-    if (status === 401 || status === 429) {
-      try {
-        const newToken = await refreshToken(creds.refreshToken);
-        const retry = await httpGet(newToken);
-        status = retry.status;
-        body = retry.body;
-      } catch {
-        // refresh failed, use original response
-      }
+    if (status === 401) {
+      rateLimitBarItem.text = "$(key) Token expired";
+      rateLimitBarItem.tooltip = "Claude Code is refreshing your session — try again shortly";
+      rateLimitBarItem.show();
+      return;
     }
 
     if (status === 200) {
