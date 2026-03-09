@@ -2,7 +2,7 @@
   "name": "claude-usage-bar",
   "displayName": "Claude Usage Bar",
   "description": "Shows your Claude Code rate limit usage in the VS Code status bar — session %, reset countdown, and color alerts. Zero token cost.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "HarshAgarwal1012",
   "repository": {
     "type": "git",
