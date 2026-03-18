@@ -189,11 +189,39 @@ function formatTimeRemaining(isoString: string): string {
   return `${minutes}m`;
 }
 
-function updateRateLimitDisplay() {
-  // Show highest utilization limit first
-  const limit = cachedRateLimit.fiveHour ?? cachedRateLimit.sevenDay ?? cachedRateLimit.sevenDaySonnet;
+function formatBar(utilPct: number): string {
+  const barLength = 10;
+  const filled = Math.round((utilPct / 100) * barLength);
+  const empty = barLength - filled;
+  return "\u2588".repeat(filled) + "\u2591".repeat(empty);
+}
 
-  if (!limit) {
+function formatLimitText(label: string, limit: RateLimitEntry): string {
+  const pct = Math.round(limit.utilization);
+  const resetStr = limit.resetsAt ? formatTimeRemaining(limit.resetsAt) : "";
+  let text = `${label} ${formatBar(pct)} ${pct}%`;
+  if (resetStr) text += ` \u00b7 ${resetStr}`;
+  return text;
+}
+
+function getMaxUtilization(limits: (RateLimitEntry | undefined)[]): number {
+  return Math.max(0, ...limits.filter(Boolean).map(l => l!.utilization));
+}
+
+function updateRateLimitDisplay() {
+  const displayMode: string = vscode.workspace.getConfiguration("claudeUsageBar").get("displayMode", "session");
+
+  // Determine which limits to show in the bar text
+  const showSession = displayMode === "session" || displayMode === "both";
+  const showWeekly = displayMode === "weekly" || displayMode === "both";
+
+  const sessionLimit = cachedRateLimit.fiveHour;
+  const weeklyLimit = cachedRateLimit.sevenDay ?? cachedRateLimit.sevenDaySonnet;
+
+  const hasSession = showSession && sessionLimit;
+  const hasWeekly = showWeekly && weeklyLimit;
+
+  if (!hasSession && !hasWeekly) {
     if (!lastFetchError) {
       rateLimitBarItem.text = "$(check) Usage OK";
       rateLimitBarItem.tooltip = "No active rate limits. Click to refresh.";
@@ -202,25 +230,32 @@ function updateRateLimitDisplay() {
     return;
   }
 
-  const utilPct = Math.round(limit.utilization);
-  const resetStr = limit.resetsAt ? formatTimeRemaining(limit.resetsAt) : undefined;
+  // Build status bar text
+  const parts: string[] = [];
+  const limitsForColor: (RateLimitEntry | undefined)[] = [];
 
-  const barLength = 10;
-  const filled = Math.round((utilPct / 100) * barLength);
-  const empty = barLength - filled;
-  const bar = "\u2588".repeat(filled) + "\u2591".repeat(empty);
+  if (hasSession) {
+    parts.push(formatLimitText("S:", sessionLimit));
+    limitsForColor.push(sessionLimit);
+  }
+  if (hasWeekly) {
+    parts.push(formatLimitText("W:", weeklyLimit));
+    limitsForColor.push(weeklyLimit);
+  }
 
-  let text = `$(pulse) ${bar} ${utilPct}%`;
-  if (resetStr) text += ` \u00b7 ${resetStr}`;
+  const text = `$(pulse) ${parts.join("  ")}`;
 
-  if (utilPct >= 90) {
+  // Color based on highest utilization among displayed limits
+  const maxUtil = getMaxUtilization(limitsForColor);
+  if (maxUtil >= 90) {
     rateLimitBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
-  } else if (utilPct >= 70) {
+  } else if (maxUtil >= 70) {
     rateLimitBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
   } else {
     rateLimitBarItem.backgroundColor = undefined;
   }
 
+  // Tooltip always shows all available limits
   const lines = ["Claude Rate Limit", "\u2500".repeat(22)];
 
   if (cachedRateLimit.fiveHour) {
