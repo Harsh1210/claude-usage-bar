@@ -53,12 +53,16 @@ No configuration needed — it works automatically once Claude Code is authentic
 
 ## Release Notes
 
-### 0.1.4
+### 0.2.0
 
-- Auto token refresh — expired OAuth tokens are refreshed automatically instead of showing "Token expired"
-- Stale state fallback — on errors (429 rate limit, network issues, auth failures), the last known usage is shown dimmed with a stale indicator instead of replacing it with an error message
-- 429 rate limit handling with retry info
-- Refresh cooldown (5 min) to prevent hammering the token endpoint
+- **Reverse-engineered from Claude Code CLI** — now matches the official implementation exactly
+- Fixed `utilization` parsing: API returns 0-1 float, not 0-100 (was showing wrong percentages)
+- Fixed `resets_at` parsing: API returns Unix epoch seconds, not ISO 8601 strings (reset times were wrong)
+- Removed self-managed token refresh — Claude Code handles its own OAuth tokens; we just re-read the keychain (eliminates 429 errors from hitting the wrong refresh endpoint)
+- Added retry with exponential backoff for 5xx errors (`[2s, 4s, 8s, 16s]`, matching CLI)
+- Stale state fallback — on errors, shows last known usage dimmed instead of losing your data
+- Persists last known state across reloads via VS Code globalState
+- Backoff on 429 — stops polling for 10 min to avoid making it worse
 
 ### 0.1.0
 
