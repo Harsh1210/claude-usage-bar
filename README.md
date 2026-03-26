@@ -9,7 +9,8 @@ Shows your **Claude Code rate limit usage** in the VS Code status bar — just l
 - **Color alerts** — yellow at 70%, red at 90%
 - **Reset countdown** — updates every 30 seconds
 - **Zero token cost** — reads directly from Anthropic's usage API, no messages sent
-- **Auto token refresh** — stays authenticated without any manual steps
+- **Auto token refresh** — automatically refreshes expired OAuth tokens using the refresh token
+- **Stale state fallback** — on errors (rate limits, network issues), shows the last known usage dimmed instead of losing your data
 
 ## Requirements
 
@@ -30,6 +31,7 @@ The status bar item shows the **highest active limit**:
 | `$(check) Usage OK` | Below all thresholds |
 | Yellow background | 70%+ used |
 | Red background | 90%+ used |
+| Dimmed text + `$(eye-closed)` | Stale data — last known usage shown after an error |
 
 **Hover** for a full breakdown of all limits (session, weekly, Sonnet, extra usage).
 **Click** to manually refresh.
@@ -50,6 +52,13 @@ No configuration needed — it works automatically once Claude Code is authentic
 - Requires Claude AI login (not API key auth)
 
 ## Release Notes
+
+### 0.1.4
+
+- Auto token refresh — expired OAuth tokens are refreshed automatically instead of showing "Token expired"
+- Stale state fallback — on errors (429 rate limit, network issues, auth failures), the last known usage is shown dimmed with a stale indicator instead of replacing it with an error message
+- 429 rate limit handling with retry info
+- Refresh cooldown (5 min) to prevent hammering the token endpoint
 
 ### 0.1.0
 
