@@ -37,6 +37,7 @@ const DATA_FILE = path.join(os.homedir(), ".claude", "usage-bar-data.json");
 let rateLimitBarItem: vscode.StatusBarItem;
 let fileWatcher: fs.FSWatcher | undefined;
 let displayRefreshInterval: ReturnType<typeof setInterval> | undefined;
+let pollInterval: ReturnType<typeof setTimeout> | undefined;
 let cachedRateLimit: RateLimitInfo = {};
 let lastGoodText: string | undefined;
 let lastGoodTooltip: string | undefined;
@@ -75,15 +76,9 @@ export function activate(context: vscode.ExtensionContext) {
   rateLimitBarItem.show();
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("claudeUsageBar.refresh", () =>
-      log("Manual refresh — data updates passively from Claude API responses")
-    ),
-    vscode.commands.registerCommand("claudeUsageBar.showDetails", () =>
-      log("Data updates passively from Claude API responses")
-    ),
-    vscode.commands.registerCommand("claudeUsageBar.refreshRateLimit", () =>
-      log("Data updates passively from Claude API responses")
-    )
+    vscode.commands.registerCommand("claudeUsageBar.refresh", () => bootstrapFetch()),
+    vscode.commands.registerCommand("claudeUsageBar.showDetails", () => bootstrapFetch()),
+    vscode.commands.registerCommand("claudeUsageBar.refreshRateLimit", () => bootstrapFetch())
   );
 
   // 1. Bootstrap: one API call to get fresh data immediately
@@ -92,10 +87,13 @@ export function activate(context: vscode.ExtensionContext) {
   // 2. Subscribe to Node.js HTTP diagnostics to passively intercept usage calls
   installDiagnosticsIntercept();
 
-  // 3. Watch statusLine data file (for terminal Claude sessions)
+  // 3. Background poll every 5 min for fresh data between diagnostics_channel events
+  startBackgroundPoll();
+
+  // 4. Watch statusLine data file (for terminal Claude sessions)
   startFileWatcher();
 
-  // 4. Refresh countdown timers every 30s and reset expired limits to 0
+  // 5. Refresh countdown timers every 30s and reset expired limits to 0
   displayRefreshInterval = setInterval(() => {
     resetExpiredLimits();
     updateDisplay();
@@ -109,6 +107,7 @@ export function activate(context: vscode.ExtensionContext) {
         fileWatcher = undefined;
       }
       if (displayRefreshInterval) clearInterval(displayRefreshInterval);
+      if (pollInterval) clearTimeout(pollInterval);
     },
   });
 
@@ -197,6 +196,70 @@ function clearStaleState() {
   rateLimitBarItem.backgroundColor = undefined;
   rateLimitBarItem.color = undefined;
   rateLimitBarItem.show();
+}
+
+// ── Background Poll ──────────────────────────────────────────────
+
+const POLL_MS = 5 * 60 * 1000; // 5 minutes
+let backoffUntil = 0;
+
+function startBackgroundPoll() {
+  const scheduleNext = () => {
+    // Add up to 1 min jitter to avoid sync with Claude Code's own polling
+    const jitter = Math.floor(Math.random() * 60_000);
+    pollInterval = setTimeout(() => {
+      backgroundFetch();
+      scheduleNext();
+    }, POLL_MS + jitter);
+  };
+  scheduleNext();
+}
+
+function backgroundFetch() {
+  // Skip if backing off from a 429
+  if (Date.now() < backoffUntil) {
+    log("Background poll: still in backoff, skipping");
+    return;
+  }
+
+  const token = readKeychainToken();
+  if (!token) return;
+
+  log("Background poll: fetching usage data...");
+
+  const options: https.RequestOptions = {
+    hostname: "api.anthropic.com",
+    path: "/api/oauth/usage",
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+      "anthropic-beta": ANTHROPIC_BETA,
+    },
+    timeout: 5000,
+  };
+
+  const req = https.request(options, (res) => {
+    let body = "";
+    res.on("data", (chunk) => (body += chunk));
+    res.on("end", () => {
+      if (res.statusCode === 200) {
+        log("Background poll: got fresh data");
+        processUsageResponse(body);
+      } else if (res.statusCode === 429) {
+        const retryAfter = res.headers["retry-after"]
+          ? parseInt(res.headers["retry-after"] as string, 10)
+          : 600;
+        backoffUntil = Date.now() + (retryAfter + 30) * 1000;
+        log(`Background poll: 429, backing off ${Math.ceil(retryAfter / 60)} min`);
+      } else {
+        log(`Background poll: HTTP ${res.statusCode}`);
+      }
+    });
+  });
+  req.on("error", () => {});
+  req.on("timeout", () => req.destroy());
+  req.end();
 }
 
 // ── Reset Expired Limits ─────────────────────────────────────────
