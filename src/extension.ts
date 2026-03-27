@@ -95,8 +95,11 @@ export function activate(context: vscode.ExtensionContext) {
   // 3. Watch statusLine data file (for terminal Claude sessions)
   startFileWatcher();
 
-  // 4. Refresh the countdown timers every 30s
-  displayRefreshInterval = setInterval(() => updateDisplay(), 30_000);
+  // 4. Refresh countdown timers every 30s and reset expired limits to 0
+  displayRefreshInterval = setInterval(() => {
+    resetExpiredLimits();
+    updateDisplay();
+  }, 30_000);
 
   context.subscriptions.push({
     dispose: () => {
@@ -194,6 +197,24 @@ function clearStaleState() {
   rateLimitBarItem.backgroundColor = undefined;
   rateLimitBarItem.color = undefined;
   rateLimitBarItem.show();
+}
+
+// ── Reset Expired Limits ─────────────────────────────────────────
+
+function resetExpiredLimits() {
+  const now = Date.now() / 1000;
+  if (cachedRateLimit.fiveHour?.resetsAt && now >= cachedRateLimit.fiveHour.resetsAt) {
+    log("Session limit expired — resetting to 0%");
+    cachedRateLimit.fiveHour = { utilization: 0, resetsAt: undefined };
+  }
+  if (cachedRateLimit.sevenDay?.resetsAt && now >= cachedRateLimit.sevenDay.resetsAt) {
+    log("Weekly limit expired — resetting to 0%");
+    cachedRateLimit.sevenDay = { utilization: 0, resetsAt: undefined };
+  }
+  if (cachedRateLimit.sevenDaySonnet?.resetsAt && now >= cachedRateLimit.sevenDaySonnet.resetsAt) {
+    log("Sonnet weekly limit expired — resetting to 0%");
+    cachedRateLimit.sevenDaySonnet = { utilization: 0, resetsAt: undefined };
+  }
 }
 
 // ── Diagnostics Channel Intercept ────────────────────────────────
