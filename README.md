@@ -1,68 +1,79 @@
 # Claude Usage Bar
 
-Shows your **Claude Code rate limit usage** in the VS Code status bar — just like the terminal bar, but always visible while you code.
+Shows your **Claude Code rate limit usage** in the VS Code status bar — always visible while you code.
 
 ## Features
 
-- **Live usage bar** — `████████░░ 82% · 1h 12m` in the status bar
+- **Live usage bar** — `S: ████████░░ 92% · 1h 12m` in the status bar
 - **Session (5hr) and weekly (7d) limits** tracked separately
+- **Display mode** — choose session, weekly, or both via settings
 - **Color alerts** — yellow at 70%, red at 90%
 - **Reset countdown** — updates every 30 seconds
-- **Zero token cost** — reads directly from Anthropic's usage API, no messages sent
-- **Auto token refresh** — automatically refreshes expired OAuth tokens using the refresh token
-- **Stale state fallback** — on errors (rate limits, network issues), shows the last known usage dimmed instead of losing your data
+- **Zero extra API calls** — passively reads Claude Code's own usage responses via Node.js `diagnostics_channel`
+- **Bootstrap on reload** — one API call on activation for fresh data immediately
+- **Persisted state** — last known usage survives VS Code restarts
 
 ## Requirements
 
 - [Claude Code](https://claude.ai/download) VS Code extension installed and signed in
-- macOS (uses the macOS Keychain for auth — Windows/Linux support coming)
+- macOS (uses the macOS Keychain for bootstrap auth — Windows/Linux support coming)
 
 ## How it works
 
-Claude Code stores your OAuth credentials in the macOS Keychain. This extension reads those credentials and calls Anthropic's `/api/oauth/usage` endpoint — the same endpoint the Claude Code extension uses internally to show usage in its sidebar. No tokens are consumed.
+Both Claude Code and this extension run in the same VS Code **extension-host Node.js process**. We use Node.js [`diagnostics_channel`](https://nodejs.org/api/diagnostics_channel.html) to passively observe all HTTP traffic. When Claude Code calls its `/api/oauth/usage` endpoint, we read the response body — zero extra API calls.
+
+On activation, a single bootstrap API call fetches fresh data immediately (using OAuth credentials from the macOS Keychain). After that, all updates come passively from intercepted responses.
+
+For terminal Claude sessions, a `statusLine` script can write rate limit data to `~/.claude/usage-bar-data.json`, which the extension watches as a fallback.
 
 ## Status Bar
 
-The status bar item shows the **highest active limit**:
-
 | Display | Meaning |
 |---------|---------|
-| `████████░░ 82% · 1h 12m` | 82% used, resets in 1h 12m |
+| `S: ████████░░ 82% · 1h 12m` | Session: 82% used, resets in 1h 12m |
+| `W: ████░░░░░░ 40% · 2d 6h` | Weekly: 40% used |
 | `$(check) Usage OK` | Below all thresholds |
 | Yellow background | 70%+ used |
 | Red background | 90%+ used |
-| Dimmed text + `$(eye-closed)` | Stale data — last known usage shown after an error |
 
 **Hover** for a full breakdown of all limits (session, weekly, Sonnet, extra usage).
-**Click** to manually refresh.
+**Click** to refresh.
+
+## Settings
+
+| Setting | Values | Default | Description |
+|---------|--------|---------|-------------|
+| `claudeUsageBar.displayMode` | `session`, `weekly`, `both` | `session` | Which rate limit to show in the status bar |
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `Claude Usage: Refresh Rate Limit` | Force refresh from API |
-
-## Settings
-
-No configuration needed — it works automatically once Claude Code is authenticated.
+| `Claude Usage: Refresh Rate Limit` | Refresh display |
 
 ## Known Limitations
 
-- macOS only (relies on `security` CLI for keychain access)
+- macOS only (bootstrap uses `security` CLI for keychain access)
 - Requires Claude AI login (not API key auth)
+- Usage updates when Claude Code fetches usage data (on panel open/refresh), not on every message
 
 ## Release Notes
 
+### 0.3.1
+
+- **`diagnostics_channel` intercept** — passively reads Claude Code's own API responses, zero extra calls
+- **Bootstrap fetch on activation** — fresh data immediately on reload
+- **Format normalization** — handles both 0-1 and 0-100 utilization scales, ISO and epoch timestamps
+- **Display mode setting** — choose session, weekly, or both
+- Clears stale cache when bootstrap gets rate limited
+
 ### 0.2.0
 
-- **Reverse-engineered from Claude Code CLI** — now matches the official implementation exactly
-- Fixed `utilization` parsing: API returns 0-1 float, not 0-100 (was showing wrong percentages)
-- Fixed `resets_at` parsing: API returns Unix epoch seconds, not ISO 8601 strings (reset times were wrong)
-- Removed self-managed token refresh — Claude Code handles its own OAuth tokens; we just re-read the keychain (eliminates 429 errors from hitting the wrong refresh endpoint)
-- Added retry with exponential backoff for 5xx errors (`[2s, 4s, 8s, 16s]`, matching CLI)
-- Stale state fallback — on errors, shows last known usage dimmed instead of losing your data
-- Persists last known state across reloads via VS Code globalState
-- Backoff on 429 — stops polling for 10 min to avoid making it worse
+- Reverse-engineered from Claude Code CLI — matched official implementation
+- Fixed utilization/timestamp parsing
+- Removed self-managed token refresh
+- Added retry with exponential backoff for 5xx errors
+- Stale state fallback and persisted state across reloads
 
 ### 0.1.0
 

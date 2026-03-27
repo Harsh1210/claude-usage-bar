@@ -1,17 +1,29 @@
 import * as vscode from "vscode";
-import * as os from "os";
+import * as http from "http";
 import * as https from "https";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
+import * as diagnostics_channel from "diagnostics_channel";
 import { execSync } from "child_process";
 
-interface RateLimitEntry {
-  utilization: number; // 0-1 from API, converted to 0-100 for display
-  resetsAt?: number;   // Unix epoch SECONDS
-}
+/**
+ * Claude Usage Bar v0.3.1
+ *
+ * How it works:
+ * Uses Node.js diagnostics_channel to passively observe ALL HTTP requests
+ * in the extension-host process. When Claude Code calls /api/oauth/usage,
+ * we read the response body — zero extra API calls, can't be bypassed by
+ * axios/follow-redirects/etc.
+ *
+ * Also watches ~/.claude/usage-bar-data.json for statusLine data from
+ * terminal Claude sessions.
+ */
 
 interface RateLimitInfo {
-  fiveHour?: RateLimitEntry;
-  sevenDay?: RateLimitEntry;
-  sevenDaySonnet?: RateLimitEntry;
+  fiveHour?: { utilization: number; resetsAt?: number };
+  sevenDay?: { utilization: number; resetsAt?: number };
+  sevenDaySonnet?: { utilization: number; resetsAt?: number };
   extraUsage?: {
     isEnabled: boolean;
     monthlyLimit?: number;
@@ -20,27 +32,27 @@ interface RateLimitInfo {
   };
 }
 
-const KEYCHAIN_SERVICE = "Claude Code-credentials";
-const ANTHROPIC_BETA = "oauth-2025-04-20";
+const DATA_FILE = path.join(os.homedir(), ".claude", "usage-bar-data.json");
 
 let rateLimitBarItem: vscode.StatusBarItem;
-let rateLimitPollInterval: ReturnType<typeof setInterval> | undefined;
-let resetCountdownInterval: ReturnType<typeof setInterval> | undefined;
+let fileWatcher: fs.FSWatcher | undefined;
+let displayRefreshInterval: ReturnType<typeof setInterval> | undefined;
 let cachedRateLimit: RateLimitInfo = {};
-let isFetchingRateLimit = false;
-let lastFetchError: string | undefined;
 let lastGoodText: string | undefined;
 let lastGoodTooltip: string | undefined;
-let backoffUntil = 0;
-let isStale = false;
 let extensionContext: vscode.ExtensionContext;
-const BACKOFF_MS = 10 * 60 * 1000;
-const SERVER_RETRY_DELAYS = [2000, 4000, 8000, 16000]; // match CLI backoff
+let outputChannel: vscode.OutputChannel;
+// Track requests to /api/oauth/usage so we can tap their responses
+const pendingUsageRequests = new WeakSet<http.ClientRequest>();
 
 export function activate(context: vscode.ExtensionContext) {
   extensionContext = context;
+  outputChannel = vscode.window.createOutputChannel("Claude Usage Bar");
+  context.subscriptions.push(outputChannel);
 
-  // Restore last known good state from persistent storage
+  log("Extension activating (v0.3.1 — diagnostics_channel intercept)");
+
+  // Restore persisted state
   lastGoodText = context.globalState.get<string>("lastGoodText");
   lastGoodTooltip = context.globalState.get<string>("lastGoodTooltip");
 
@@ -49,207 +61,365 @@ export function activate(context: vscode.ExtensionContext) {
     52
   );
   rateLimitBarItem.command = "claudeUsageBar.refreshRateLimit";
-  rateLimitBarItem.tooltip = "Click to refresh";
   context.subscriptions.push(rateLimitBarItem);
 
-  // Show persisted state immediately (or 0% baseline) while we fetch
-  if (!lastGoodText) {
-    lastGoodText = "$(pulse) \u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591 0%";
-    lastGoodTooltip = "Claude Rate Limit\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nNo data yet";
+  // Show persisted state or waiting message
+  if (lastGoodText) {
+    rateLimitBarItem.text = lastGoodText;
+    rateLimitBarItem.tooltip = lastGoodTooltip ?? "Click to refresh";
+  } else {
+    rateLimitBarItem.text = "$(pulse) Waiting for Claude...";
+    rateLimitBarItem.tooltip =
+      "Claude Usage Bar\n──────────────────────\nWaiting for usage data.\nSend a message in Claude to see usage.";
   }
-  rateLimitBarItem.text = `${lastGoodText} $(eye-closed)`;
-  rateLimitBarItem.tooltip = `${lastGoodTooltip}\n\n\u26A0 Stale \u2014 refreshing...`;
-  rateLimitBarItem.color = new vscode.ThemeColor("disabledForeground");
   rateLimitBarItem.show();
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("claudeUsageBar.refresh", () => fetchRateLimit(true)),
-    vscode.commands.registerCommand("claudeUsageBar.showDetails", () => fetchRateLimit(true)),
-    vscode.commands.registerCommand("claudeUsageBar.refreshRateLimit", () => fetchRateLimit(true))
+    vscode.commands.registerCommand("claudeUsageBar.refresh", () =>
+      log("Manual refresh — data updates passively from Claude API responses")
+    ),
+    vscode.commands.registerCommand("claudeUsageBar.showDetails", () =>
+      log("Data updates passively from Claude API responses")
+    ),
+    vscode.commands.registerCommand("claudeUsageBar.refreshRateLimit", () =>
+      log("Data updates passively from Claude API responses")
+    )
   );
 
-  fetchRateLimit();
-  rateLimitPollInterval = setInterval(() => fetchRateLimit(), 5 * 60 * 1000);
-  resetCountdownInterval = setInterval(() => updateRateLimitDisplay(), 30_000);
+  // 1. Bootstrap: one API call to get fresh data immediately
+  bootstrapFetch();
+
+  // 2. Subscribe to Node.js HTTP diagnostics to passively intercept usage calls
+  installDiagnosticsIntercept();
+
+  // 3. Watch statusLine data file (for terminal Claude sessions)
+  startFileWatcher();
+
+  // 4. Refresh the countdown timers every 30s
+  displayRefreshInterval = setInterval(() => updateDisplay(), 30_000);
 
   context.subscriptions.push({
     dispose: () => {
-      if (rateLimitPollInterval) clearInterval(rateLimitPollInterval);
-      if (resetCountdownInterval) clearInterval(resetCountdownInterval);
+      uninstallDiagnosticsIntercept();
+      if (fileWatcher) {
+        fileWatcher.close();
+        fileWatcher = undefined;
+      }
+      if (displayRefreshInterval) clearInterval(displayRefreshInterval);
     },
   });
+
+  log("Ready — listening for Claude Code usage API responses via diagnostics_channel");
 }
 
-// ── Keychain ─────────────────────────────────────────────────────
+function log(msg: string) {
+  const ts = new Date().toISOString().slice(11, 19);
+  outputChannel.appendLine(`[${ts}] ${msg}`);
+}
 
-function readKeychain(): { accessToken: string; refreshToken: string; clientId?: string; scopes?: string[] } | undefined {
+// ── Bootstrap Fetch (one call on activation) ─────────────────────
+
+const KEYCHAIN_SERVICE = "Claude Code-credentials";
+const ANTHROPIC_BETA = "oauth-2025-04-20";
+
+function readKeychainToken(): string | undefined {
   if (process.platform !== "darwin") return undefined;
   try {
-    const username = process.env.USER || os.userInfo().username || "claude-user";
+    const username =
+      process.env.USER || os.userInfo().username || "claude-user";
     const raw = execSync(
       `security find-generic-password -a "${username}" -w -s "${KEYCHAIN_SERVICE}"`,
       { encoding: "utf-8", timeout: 5000 }
     ).trim();
     const creds = JSON.parse(raw);
-    const oauth = creds?.claudeAiOauth;
-    if (oauth?.accessToken && oauth?.refreshToken) {
-      return {
-        accessToken: oauth.accessToken,
-        refreshToken: oauth.refreshToken,
-        clientId: oauth.clientId,
-        scopes: oauth.scopes,
+    return creds?.claudeAiOauth?.accessToken;
+  } catch {
+    return undefined;
+  }
+}
+
+function bootstrapFetch() {
+  const token = readKeychainToken();
+  if (!token) {
+    log("Bootstrap: no keychain token found, skipping");
+    return;
+  }
+
+  log("Bootstrap: fetching usage data...");
+
+  const options: https.RequestOptions = {
+    hostname: "api.anthropic.com",
+    path: "/api/oauth/usage",
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+      "anthropic-beta": ANTHROPIC_BETA,
+    },
+    timeout: 5000,
+  };
+
+  const req = https.request(options, (res) => {
+    let body = "";
+    res.on("data", (chunk) => (body += chunk));
+    res.on("end", () => {
+      if (res.statusCode === 200) {
+        log(`Bootstrap: got usage data`);
+        processUsageResponse(body);
+      } else {
+        log(`Bootstrap: HTTP ${res.statusCode}, clearing stale cache`);
+        clearStaleState();
+      }
+    });
+  });
+  req.on("error", (err) => {
+    log(`Bootstrap: network error (${err.message}), using persisted state`);
+  });
+  req.on("timeout", () => {
+    req.destroy();
+    log("Bootstrap: timeout, using persisted state");
+  });
+  req.end();
+}
+
+function clearStaleState() {
+  cachedRateLimit = {};
+  lastGoodText = undefined;
+  lastGoodTooltip = undefined;
+  extensionContext.globalState.update("lastGoodText", undefined);
+  extensionContext.globalState.update("lastGoodTooltip", undefined);
+  rateLimitBarItem.text = "$(pulse) Waiting for Claude...";
+  rateLimitBarItem.tooltip =
+    "Claude Usage Bar\n──────────────────────\nWaiting for usage data.\nSend a message in Claude to see usage.";
+  rateLimitBarItem.backgroundColor = undefined;
+  rateLimitBarItem.color = undefined;
+  rateLimitBarItem.show();
+}
+
+// ── Diagnostics Channel Intercept ────────────────────────────────
+// Node.js fires 'http.client.request.start' for EVERY outbound HTTP request,
+// regardless of which library initiated it (axios, follow-redirects, fetch, etc.)
+
+function installDiagnosticsIntercept() {
+  try {
+    // 'http.client.request.start' fires when a request is sent
+    // The message contains { request: http.ClientRequest }
+    diagnostics_channel.subscribe(
+      "http.client.request.start",
+      (message: unknown) => {
+        try {
+          const msg = message as { request: http.ClientRequest };
+          const req = msg.request;
+          if (!req) return;
+
+          // Check if this request is to the usage endpoint
+          const reqPath = (req as any).path as string | undefined;
+          const reqHost = (req as any).getHeader?.("host") as string | undefined;
+
+          const isUsageCall =
+            reqPath?.includes("/api/oauth/usage") &&
+            (reqHost?.includes("anthropic.com") ||
+              reqHost === undefined); // host may not be set yet
+
+          if (isUsageCall) {
+            log(`Detected usage API request: ${reqPath}`);
+            pendingUsageRequests.add(req);
+          }
+        } catch {
+          // Never break other extensions
+        }
+      }
+    );
+
+    // 'http.client.response.finish' fires when a response is fully received
+    // The message contains { request, response }
+    diagnostics_channel.subscribe(
+      "http.client.response.finish",
+      (message: unknown) => {
+        try {
+          const msg = message as {
+            request: http.ClientRequest;
+            response: http.IncomingMessage;
+          };
+          if (!pendingUsageRequests.has(msg.request)) return;
+          pendingUsageRequests.delete(msg.request);
+
+          const res = msg.response;
+          log(`Usage API response: ${res.statusCode}`);
+
+          if (res.statusCode === 200) {
+            tapResponseBody(res);
+          }
+        } catch {
+          // Never break other extensions
+        }
+      }
+    );
+
+    log("diagnostics_channel subscriptions installed");
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(`Failed to install diagnostics_channel: ${msg}`);
+    log("Falling back to file watcher only");
+  }
+}
+
+function uninstallDiagnosticsIntercept() {
+  try {
+    diagnostics_channel.unsubscribe("http.client.request.start", () => {});
+    diagnostics_channel.unsubscribe("http.client.response.finish", () => {});
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+function tapResponseBody(res: http.IncomingMessage) {
+  let body = "";
+  const origOn = res.on.bind(res);
+
+  res.on = function (
+    event: string,
+    listener: (...args: any[]) => void
+  ): http.IncomingMessage {
+    if (event === "data") {
+      const wrapped = (chunk: Buffer | string) => {
+        body += chunk.toString();
+        listener(chunk);
       };
+      return origOn.call(res, event, wrapped) as http.IncomingMessage;
     }
-  } catch { /* ignore */ }
+    if (event === "end") {
+      const wrapped = (...args: unknown[]) => {
+        try {
+          if (body) processUsageResponse(body);
+        } catch {
+          // never break Claude Code
+        }
+        listener(...args);
+      };
+      return origOn.call(res, event, wrapped) as http.IncomingMessage;
+    }
+    return origOn.call(res, event, listener) as http.IncomingMessage;
+  };
+}
+
+/** Parse resets_at which can be epoch seconds (number) or ISO string */
+function parseResetsAt(value: unknown): number | undefined {
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const ms = new Date(value).getTime();
+    return isNaN(ms) ? undefined : ms / 1000;
+  }
   return undefined;
 }
 
-// ── HTTP helpers ─────────────────────────────────────────────────
-
-function httpGet(token: string): Promise<{ status: number; body: string }> {
-  return new Promise((resolve, reject) => {
-    const options: https.RequestOptions = {
-      hostname: "api.anthropic.com",
-      path: "/api/oauth/usage",
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-        "anthropic-beta": ANTHROPIC_BETA,
-      },
-      timeout: 5000, // match CLI: 5s timeout
-    };
-    const req = https.request(options, (res) => {
-      let data = "";
-      res.on("data", (c) => (data += c));
-      res.on("end", () => resolve({ status: res.statusCode ?? 0, body: data }));
-    });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
-    req.end();
-  });
+/** Normalize utilization — API may return 0-1 or 0-100 */
+function normalizeUtilization(value: number): number {
+  return value > 1 ? value / 100 : value;
 }
 
-/** Retry with exponential backoff for 5xx errors, matching CLI behavior */
-async function httpGetWithRetry(token: string): Promise<{ status: number; body: string }> {
-  let lastResult = await httpGet(token);
-  if (lastResult.status < 500) return lastResult;
-
-  for (const delay of SERVER_RETRY_DELAYS) {
-    console.log(`[claude-usage-bar] Server error ${lastResult.status}, retrying in ${delay}ms...`);
-    await new Promise(r => setTimeout(r, delay));
-    lastResult = await httpGet(token);
-    if (lastResult.status < 500) return lastResult;
-  }
-  return lastResult;
-}
-
-// ── Fetch Usage ──────────────────────────────────────────────────
-
-async function fetchRateLimit(manual = false) {
-  if (isFetchingRateLimit) return;
-
-  // Skip if backing off (unless user clicked manually)
-  if (!manual && Date.now() < backoffUntil) return;
-
-  isFetchingRateLimit = true;
-
-  // Only show spinner on first load — otherwise keep current display
-  if (!lastGoodText) {
-    rateLimitBarItem.text = "$(sync~spin) Checking...";
-    rateLimitBarItem.show();
-  }
-
+function processUsageResponse(body: string) {
   try {
-    const creds = readKeychain();
-    if (!creds) {
-      showStaleOrFallback("$(key) No auth token", "Could not read OAuth token from keychain");
-      return;
+    const parsed = JSON.parse(body);
+    log(`Intercepted usage data: ${body.slice(0, 200)}`);
+
+    cachedRateLimit = {};
+
+    if (parsed.five_hour?.utilization != null) {
+      cachedRateLimit.fiveHour = {
+        utilization: normalizeUtilization(parsed.five_hour.utilization),
+        resetsAt: parseResetsAt(parsed.five_hour.resets_at),
+      };
+    }
+    if (parsed.seven_day?.utilization != null) {
+      cachedRateLimit.sevenDay = {
+        utilization: normalizeUtilization(parsed.seven_day.utilization),
+        resetsAt: parseResetsAt(parsed.seven_day.resets_at),
+      };
+    }
+    if (parsed.seven_day_sonnet?.utilization != null) {
+      cachedRateLimit.sevenDaySonnet = {
+        utilization: normalizeUtilization(parsed.seven_day_sonnet.utilization),
+        resetsAt: parseResetsAt(parsed.seven_day_sonnet.resets_at),
+      };
+    }
+    if (parsed.extra_usage) {
+      cachedRateLimit.extraUsage = {
+        isEnabled: parsed.extra_usage.is_enabled,
+        monthlyLimit: parsed.extra_usage.monthly_limit,
+        usedCredits: parsed.extra_usage.used_credits,
+        utilization: parsed.extra_usage.utilization != null
+          ? normalizeUtilization(parsed.extra_usage.utilization)
+          : undefined,
+      };
     }
 
-    // Always re-read token from keychain — Claude Code handles its own refresh.
-    // We never refresh tokens ourselves to avoid corrupting Claude Code's state.
-    const { status, body } = await httpGetWithRetry(creds.accessToken);
-
-    if (status === 401) {
-      showStaleOrFallback("$(key) Token expired", "Token expired \u2014 Claude Code will refresh it automatically. Try again shortly.");
-      return;
-    }
-
-    if (status === 429) {
-      backoffUntil = Date.now() + BACKOFF_MS;
-      lastFetchError = "429";
-      showStaleOrFallback("$(clock) Rate limited", "API rate limited \u2014 will retry in 10 min");
-      return;
-    }
-
-    if (status === 200) {
-      const parsed = JSON.parse(body);
-      console.log("[claude-usage-bar] Raw API response:", JSON.stringify(parsed, null, 2));
-      cachedRateLimit = {};
-
-      // API returns utilization as 0-1 float, resets_at as Unix epoch seconds
-      if (parsed.five_hour?.utilization != null) {
-        cachedRateLimit.fiveHour = {
-          utilization: parsed.five_hour.utilization,
-          resetsAt: parsed.five_hour.resets_at,
-        };
-      }
-      if (parsed.seven_day?.utilization != null) {
-        cachedRateLimit.sevenDay = {
-          utilization: parsed.seven_day.utilization,
-          resetsAt: parsed.seven_day.resets_at,
-        };
-      }
-      if (parsed.seven_day_sonnet?.utilization != null) {
-        cachedRateLimit.sevenDaySonnet = {
-          utilization: parsed.seven_day_sonnet.utilization,
-          resetsAt: parsed.seven_day_sonnet.resets_at,
-        };
-      }
-      if (parsed.extra_usage) {
-        cachedRateLimit.extraUsage = {
-          isEnabled: parsed.extra_usage.is_enabled,
-          monthlyLimit: parsed.extra_usage.monthly_limit,
-          usedCredits: parsed.extra_usage.used_credits,
-          utilization: parsed.extra_usage.utilization,
-        };
-      }
-      lastFetchError = undefined;
-      backoffUntil = 0;
-      isStale = false;
-      updateRateLimitDisplay();
-    } else {
-      lastFetchError = `HTTP ${status}`;
-      showStaleOrFallback(`$(warning) Error ${status}`, body.slice(0, 200));
-    }
+    updateDisplay();
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    lastFetchError = msg;
-    showStaleOrFallback("$(warning) Network error", msg);
-  } finally {
-    isFetchingRateLimit = false;
+    log(`Error parsing intercepted response: ${msg}`);
   }
 }
 
-function showStaleOrFallback(fallbackText: string, errorDetail: string) {
-  isStale = true;
-  if (lastGoodText) {
-    rateLimitBarItem.text = `${lastGoodText} $(eye-closed)`;
-    rateLimitBarItem.tooltip = `${lastGoodTooltip}\n\n\u26A0 Stale \u2014 ${errorDetail}\nClick to retry`;
-    rateLimitBarItem.backgroundColor = undefined;
-    rateLimitBarItem.color = new vscode.ThemeColor("disabledForeground");
-  } else {
-    rateLimitBarItem.text = fallbackText;
-    rateLimitBarItem.tooltip = errorDetail;
-    rateLimitBarItem.color = undefined;
+// ── File Watcher (statusLine fallback for terminal sessions) ─────
+
+function startFileWatcher() {
+  try {
+    const dir = path.dirname(DATA_FILE);
+    const basename = path.basename(DATA_FILE);
+    if (!fs.existsSync(dir)) return;
+
+    fileWatcher = fs.watch(dir, (eventType, filename) => {
+      if (filename === basename) {
+        readDataFile();
+      }
+    });
+    fileWatcher.on("error", () => {
+      /* rely on intercept */
+    });
+  } catch {
+    /* optional fallback */
   }
-  rateLimitBarItem.show();
+
+  // Also read once on startup in case file already exists
+  readDataFile();
+}
+
+function readDataFile() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return;
+
+    const raw = fs.readFileSync(DATA_FILE, "utf-8");
+    const parsed = JSON.parse(raw);
+
+    const age = parsed.timestamp
+      ? Date.now() / 1000 - parsed.timestamp
+      : Infinity;
+    if (age > 6 * 3600) return; // too old
+
+    // statusLine format uses used_percentage (0-100), convert to 0-1
+    if (parsed.rate_limits?.five_hour) {
+      cachedRateLimit.fiveHour = {
+        utilization: parsed.rate_limits.five_hour.used_percentage / 100,
+        resetsAt: parsed.rate_limits.five_hour.resets_at,
+      };
+    }
+    if (parsed.rate_limits?.seven_day) {
+      cachedRateLimit.sevenDay = {
+        utilization: parsed.rate_limits.seven_day.used_percentage / 100,
+        resetsAt: parsed.rate_limits.seven_day.resets_at,
+      };
+    }
+
+    log(`Read statusLine file data (age: ${Math.floor(age)}s)`);
+    updateDisplay();
+  } catch {
+    /* optional */
+  }
 }
 
 // ── Display ──────────────────────────────────────────────────────
 
-/** Format Unix epoch seconds to human-readable remaining time */
 function formatTimeRemaining(epochSeconds: number): string {
   const diff = Math.floor(epochSeconds - Date.now() / 1000);
   if (diff <= 0) return "soon";
@@ -259,75 +429,120 @@ function formatTimeRemaining(epochSeconds: number): string {
   return `${minutes}m`;
 }
 
-function updateRateLimitDisplay() {
-  // Don't overwrite stale/error display — wait for a successful fetch
-  if (isStale) return;
-
-  const limit = cachedRateLimit.fiveHour ?? cachedRateLimit.sevenDay ?? cachedRateLimit.sevenDaySonnet;
-
-  if (!limit) {
-    if (!lastFetchError) {
-      rateLimitBarItem.text = "$(check) Usage OK";
-      rateLimitBarItem.tooltip = "No active rate limits. Click to refresh.";
-      rateLimitBarItem.backgroundColor = undefined;
-      rateLimitBarItem.color = undefined;
-      rateLimitBarItem.show();
-    }
-    return;
-  }
-
-  // utilization is 0-1 from API — multiply by 100 for display (matching CLI)
-  const utilPct = Math.floor(limit.utilization * 100);
-  const resetStr = limit.resetsAt ? formatTimeRemaining(limit.resetsAt) : undefined;
-
+function formatBar(utilPct: number): string {
   const barLength = 10;
   const filled = Math.round((utilPct / 100) * barLength);
   const empty = barLength - filled;
-  const bar = "\u2588".repeat(filled) + "\u2591".repeat(empty);
+  return "\u2588".repeat(filled) + "\u2591".repeat(empty);
+}
 
-  let text = `$(pulse) ${bar} ${utilPct}%`;
+function formatLimitText(
+  label: string,
+  utilization: number,
+  resetsAt?: number
+): string {
+  const pct = Math.floor(utilization * 100);
+  const resetStr = resetsAt ? formatTimeRemaining(resetsAt) : "";
+  let text = `${label} ${formatBar(pct)} ${pct}%`;
   if (resetStr) text += ` \u00b7 ${resetStr}`;
+  return text;
+}
 
-  if (utilPct >= 90) {
-    rateLimitBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
-  } else if (utilPct >= 70) {
-    rateLimitBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+function updateDisplay() {
+  const displayMode: string = vscode.workspace
+    .getConfiguration("claudeUsageBar")
+    .get("displayMode", "session");
+  const showSession = displayMode === "session" || displayMode === "both";
+  const showWeekly = displayMode === "weekly" || displayMode === "both";
+
+  const sessionLimit = cachedRateLimit.fiveHour;
+  const weeklyLimit =
+    cachedRateLimit.sevenDay ?? cachedRateLimit.sevenDaySonnet;
+
+  const hasSession = showSession && sessionLimit;
+  const hasWeekly = showWeekly && weeklyLimit;
+
+  if (!hasSession && !hasWeekly) {
+    if (lastGoodText) return;
+    rateLimitBarItem.text = "$(check) Usage OK";
+    rateLimitBarItem.tooltip = "No active rate limits.\nClick to refresh.";
+    rateLimitBarItem.backgroundColor = undefined;
+    rateLimitBarItem.color = undefined;
+    rateLimitBarItem.show();
+    return;
+  }
+
+  const parts: string[] = [];
+  const pcts: number[] = [];
+
+  if (hasSession) {
+    parts.push(
+      formatLimitText("S:", sessionLimit.utilization, sessionLimit.resetsAt)
+    );
+    pcts.push(Math.floor(sessionLimit.utilization * 100));
+  }
+  if (hasWeekly) {
+    parts.push(
+      formatLimitText("W:", weeklyLimit.utilization, weeklyLimit.resetsAt)
+    );
+    pcts.push(Math.floor(weeklyLimit.utilization * 100));
+  }
+
+  const text = `$(pulse) ${parts.join("  ")}`;
+
+  const maxPct = Math.max(...pcts);
+  if (maxPct >= 90) {
+    rateLimitBarItem.backgroundColor = new vscode.ThemeColor(
+      "statusBarItem.errorBackground"
+    );
+  } else if (maxPct >= 70) {
+    rateLimitBarItem.backgroundColor = new vscode.ThemeColor(
+      "statusBarItem.warningBackground"
+    );
   } else {
     rateLimitBarItem.backgroundColor = undefined;
   }
+  rateLimitBarItem.color = undefined;
 
+  // Tooltip
   const lines = ["Claude Rate Limit", "\u2500".repeat(22)];
 
   if (cachedRateLimit.fiveHour) {
     const pct = Math.floor(cachedRateLimit.fiveHour.utilization * 100);
-    const rst = cachedRateLimit.fiveHour.resetsAt ? formatTimeRemaining(cachedRateLimit.fiveHour.resetsAt) : "?";
+    const rst = cachedRateLimit.fiveHour.resetsAt
+      ? formatTimeRemaining(cachedRateLimit.fiveHour.resetsAt)
+      : "?";
     lines.push(`Session (5hr):  ${pct}%  \u00b7  resets ${rst}`);
   }
   if (cachedRateLimit.sevenDay) {
     const pct = Math.floor(cachedRateLimit.sevenDay.utilization * 100);
-    const rst = cachedRateLimit.sevenDay.resetsAt ? formatTimeRemaining(cachedRateLimit.sevenDay.resetsAt) : "?";
+    const rst = cachedRateLimit.sevenDay.resetsAt
+      ? formatTimeRemaining(cachedRateLimit.sevenDay.resetsAt)
+      : "?";
     lines.push(`Weekly (7d):    ${pct}%  \u00b7  resets ${rst}`);
   }
   if (cachedRateLimit.sevenDaySonnet) {
     const pct = Math.floor(cachedRateLimit.sevenDaySonnet.utilization * 100);
-    const rst = cachedRateLimit.sevenDaySonnet.resetsAt ? formatTimeRemaining(cachedRateLimit.sevenDaySonnet.resetsAt) : "?";
+    const rst = cachedRateLimit.sevenDaySonnet.resetsAt
+      ? formatTimeRemaining(cachedRateLimit.sevenDaySonnet.resetsAt)
+      : "?";
     lines.push(`Sonnet (7d):    ${pct}%  \u00b7  resets ${rst}`);
   }
   if (cachedRateLimit.extraUsage) {
     const eu = cachedRateLimit.extraUsage;
     if (eu.usedCredits != null && eu.monthlyLimit != null) {
-      lines.push(`Extra usage:    $${eu.usedCredits.toFixed(0)}/$${eu.monthlyLimit} (${Math.floor((eu.utilization ?? 0) * 100)}%)`);
+      lines.push(
+        `Extra usage:    $${eu.usedCredits.toFixed(0)}/$${eu.monthlyLimit} (${Math.floor((eu.utilization ?? 0) * 100)}%)`
+      );
     }
   }
 
-  lines.push("", "Click to refresh");
+  lines.push("", "Updates automatically with Claude API responses");
 
-  rateLimitBarItem.color = undefined;
   rateLimitBarItem.text = text;
   rateLimitBarItem.tooltip = lines.join("\n");
   rateLimitBarItem.show();
 
-  // Cache for stale display on errors — persist across reloads
   lastGoodText = text;
   lastGoodTooltip = lines.join("\n");
   extensionContext.globalState.update("lastGoodText", lastGoodText);
@@ -335,6 +550,10 @@ function updateRateLimitDisplay() {
 }
 
 export function deactivate() {
-  if (rateLimitPollInterval) clearInterval(rateLimitPollInterval);
-  if (resetCountdownInterval) clearInterval(resetCountdownInterval);
+  uninstallDiagnosticsIntercept();
+  if (fileWatcher) {
+    fileWatcher.close();
+    fileWatcher = undefined;
+  }
+  if (displayRefreshInterval) clearInterval(displayRefreshInterval);
 }

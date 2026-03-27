@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Background circle -->
+  <circle cx="64" cy="64" r="60" fill="#1e1e2e"/>
+
+  <!-- Gauge track (gray arc, 240° from bottom-left to bottom-right) -->
+  <path d="M 27.6 85 A 42 42 0 1 1 100.4 85"
+        fill="none" stroke="#3a3a4a" stroke-width="8" stroke-linecap="round"/>
+
+  <!-- Gauge fill (amber arc, ~65% of track) -->
+  <path d="M 27.6 85 A 42 42 0 0 1 88.7 30"
+        fill="none" stroke="#D97706" stroke-width="8" stroke-linecap="round"/>
+
+  <!-- Center dot -->
+  <circle cx="64" cy="64" r="4" fill="#D97706"/>
+
+  <!-- Needle pointing to ~65% mark -->
+  <line x1="64" y1="64" x2="81.6" y2="39.7"
+        stroke="#D97706" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Small percentage text -->
+  <text x="64" y="100" text-anchor="middle"
+        font-family="sans-serif" font-size="14" font-weight="bold" fill="#D97706">%</text>
+</svg>
