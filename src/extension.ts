@@ -5,7 +5,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import * as diagnostics_channel from "diagnostics_channel";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 
 /**
  * Claude Usage Bar v0.3.1
@@ -45,6 +45,12 @@ let extensionContext: vscode.ExtensionContext;
 let outputChannel: vscode.OutputChannel;
 // Track requests to /api/oauth/usage so we can tap their responses
 const pendingUsageRequests = new WeakSet<http.ClientRequest>();
+
+// Stored references required for diagnostics_channel.unsubscribe to work.
+// unsubscribe() matches by function identity — passing a new lambda is a no-op
+// and leaves stale handlers accumulating across extension reloads.
+let dcRequestHandler: ((msg: unknown) => void) | undefined;
+let dcResponseHandler: ((msg: unknown) => void) | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   extensionContext = context;
@@ -129,8 +135,12 @@ function readKeychainToken(): string | undefined {
   try {
     const username =
       process.env.USER || os.userInfo().username || "claude-user";
-    const raw = execSync(
-      `security find-generic-password -a "${username}" -w -s "${KEYCHAIN_SERVICE}"`,
+    // execFileSync bypasses the shell entirely — no interpolation of $() or backticks.
+    // Using execSync with a template string would allow command injection if USER
+    // contains shell metacharacters (e.g. set via a malicious .envrc).
+    const raw = execFileSync(
+      "security",
+      ["find-generic-password", "-a", username, "-w", "-s", KEYCHAIN_SERVICE],
       { encoding: "utf-8", timeout: 5000 }
     ).trim();
     const creds = JSON.parse(raw);
@@ -163,7 +173,7 @@ function bootstrapFetch() {
 
   const req = https.request(options, (res) => {
     let body = "";
-    res.on("data", (chunk) => (body += chunk));
+    res.on("data", (chunk) => { if (body.length < MAX_RESPONSE_BYTES) body += chunk; });
     res.on("end", () => {
       if (res.statusCode === 200) {
         log(`Bootstrap: got usage data`);
@@ -241,15 +251,16 @@ function backgroundFetch() {
 
   const req = https.request(options, (res) => {
     let body = "";
-    res.on("data", (chunk) => (body += chunk));
+    res.on("data", (chunk) => { if (body.length < MAX_RESPONSE_BYTES) body += chunk; });
     res.on("end", () => {
       if (res.statusCode === 200) {
         log("Background poll: got fresh data");
         processUsageResponse(body);
       } else if (res.statusCode === 429) {
-        const retryAfter = res.headers["retry-after"]
-          ? parseInt(res.headers["retry-after"] as string, 10)
-          : 600;
+        // parseInt returns NaN for date-string Retry-After values ("Wed, 01 Apr ..."),
+        // and Date.now() + NaN = NaN makes the backoff condition never true. Fall back to 10 min.
+        const retryAfterParsed = parseInt(res.headers["retry-after"] as string ?? "", 10);
+        const retryAfter = Number.isFinite(retryAfterParsed) ? retryAfterParsed : 600;
         backoffUntil = Date.now() + (retryAfter + 30) * 1000;
         log(`Background poll: 429, backing off ${Math.ceil(retryAfter / 60)} min`);
       } else {
@@ -285,60 +296,64 @@ function resetExpiredLimits() {
 // regardless of which library initiated it (axios, follow-redirects, fetch, etc.)
 
 function installDiagnosticsIntercept() {
+  // Guard: do not register duplicate handlers on extension reload
+  if (dcRequestHandler || dcResponseHandler) {
+    uninstallDiagnosticsIntercept();
+  }
+
   try {
     // 'http.client.request.start' fires when a request is sent
     // The message contains { request: http.ClientRequest }
-    diagnostics_channel.subscribe(
-      "http.client.request.start",
-      (message: unknown) => {
-        try {
-          const msg = message as { request: http.ClientRequest };
-          const req = msg.request;
-          if (!req) return;
+    dcRequestHandler = (message: unknown) => {
+      try {
+        const msg = message as { request: http.ClientRequest };
+        const req = msg.request;
+        if (!req) return;
 
-          // Check if this request is to the usage endpoint
-          const reqPath = (req as any).path as string | undefined;
-          const reqHost = (req as any).getHeader?.("host") as string | undefined;
+        // Check if this request is to the usage endpoint
+        const reqPath = (req as any).path as string | undefined;
+        const reqHost = (req as any).getHeader?.("host") as string | undefined;
 
-          const isUsageCall =
-            reqPath?.includes("/api/oauth/usage") &&
-            (reqHost?.includes("anthropic.com") ||
-              reqHost === undefined); // host may not be set yet
+        // Require an explicit anthropic.com host — the original code also accepted
+        // undefined host, which would match any request whose headers weren't set
+        // yet, including requests from unrelated extensions.
+        const isUsageCall =
+          reqPath?.includes("/api/oauth/usage") &&
+          reqHost?.includes("anthropic.com");
 
-          if (isUsageCall) {
-            log(`Detected usage API request: ${reqPath}`);
-            pendingUsageRequests.add(req);
-          }
-        } catch {
-          // Never break other extensions
+        if (isUsageCall) {
+          log(`Detected usage API request: ${reqPath}`);
+          pendingUsageRequests.add(req);
         }
+      } catch {
+        // Never break other extensions
       }
-    );
+    };
 
     // 'http.client.response.finish' fires when a response is fully received
     // The message contains { request, response }
-    diagnostics_channel.subscribe(
-      "http.client.response.finish",
-      (message: unknown) => {
-        try {
-          const msg = message as {
-            request: http.ClientRequest;
-            response: http.IncomingMessage;
-          };
-          if (!pendingUsageRequests.has(msg.request)) return;
-          pendingUsageRequests.delete(msg.request);
+    dcResponseHandler = (message: unknown) => {
+      try {
+        const msg = message as {
+          request: http.ClientRequest;
+          response: http.IncomingMessage;
+        };
+        if (!pendingUsageRequests.has(msg.request)) return;
+        pendingUsageRequests.delete(msg.request);
 
-          const res = msg.response;
-          log(`Usage API response: ${res.statusCode}`);
+        const res = msg.response;
+        log(`Usage API response: ${res.statusCode}`);
 
-          if (res.statusCode === 200) {
-            tapResponseBody(res);
-          }
-        } catch {
-          // Never break other extensions
+        if (res.statusCode === 200) {
+          tapResponseBody(res);
         }
+      } catch {
+        // Never break other extensions
       }
-    );
+    };
+
+    diagnostics_channel.subscribe("http.client.request.start", dcRequestHandler);
+    diagnostics_channel.subscribe("http.client.response.finish", dcResponseHandler);
 
     log("diagnostics_channel subscriptions installed");
   } catch (err: unknown) {
@@ -350,12 +365,22 @@ function installDiagnosticsIntercept() {
 
 function uninstallDiagnosticsIntercept() {
   try {
-    diagnostics_channel.unsubscribe("http.client.request.start", () => {});
-    diagnostics_channel.unsubscribe("http.client.response.finish", () => {});
+    if (dcRequestHandler) {
+      diagnostics_channel.unsubscribe("http.client.request.start", dcRequestHandler);
+      dcRequestHandler = undefined;
+    }
+    if (dcResponseHandler) {
+      diagnostics_channel.unsubscribe("http.client.response.finish", dcResponseHandler);
+      dcResponseHandler = undefined;
+    }
   } catch {
     // ignore cleanup errors
   }
 }
+
+// Guard against an unexpectedly large response body (CDN error, MITM) consuming
+// unbounded memory. The real usage response is ~200 bytes.
+const MAX_RESPONSE_BYTES = 1024 * 1024; // 1 MB hard cap
 
 function tapResponseBody(res: http.IncomingMessage) {
   let body = "";
@@ -367,7 +392,9 @@ function tapResponseBody(res: http.IncomingMessage) {
   ): http.IncomingMessage {
     if (event === "data") {
       const wrapped = (chunk: Buffer | string) => {
-        body += chunk.toString();
+        if (body.length < MAX_RESPONSE_BYTES) {
+          body += chunk.toString();
+        }
         listener(chunk);
       };
       return origOn.call(res, event, wrapped) as http.IncomingMessage;
@@ -476,9 +503,10 @@ function readDataFile() {
     const raw = fs.readFileSync(DATA_FILE, "utf-8");
     const parsed = JSON.parse(raw);
 
-    const age = parsed.timestamp
-      ? Date.now() / 1000 - parsed.timestamp
-      : Infinity;
+    // Strict type check before arithmetic: a truthy non-number (e.g. the string "now")
+    // produces NaN, which makes the age check always false and bypasses the 6-hour limit.
+    if (typeof parsed.timestamp !== "number") return;
+    const age = Date.now() / 1000 - parsed.timestamp;
     if (age > 6 * 3600) return; // too old
 
     // statusLine format uses used_percentage (0-100), convert to 0-1
