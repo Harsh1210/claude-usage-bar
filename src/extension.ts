@@ -8,7 +8,7 @@ import * as diagnostics_channel from "diagnostics_channel";
 import { execFileSync } from "child_process";
 
 /**
- * Claude Usage Bar v0.3.1
+ * Claude Usage Bar v0.3.3
  *
  * How it works:
  * Uses Node.js diagnostics_channel to passively observe ALL HTTP requests
@@ -42,6 +42,7 @@ let cachedRateLimit: RateLimitInfo = {};
 let lastGoodText: string | undefined;
 let lastGoodTooltip: string | undefined;
 let extensionContext: vscode.ExtensionContext;
+let activeDisplayMode: string = "session";
 let outputChannel: vscode.OutputChannel;
 // Track requests to /api/oauth/usage so we can tap their responses
 const pendingUsageRequests = new WeakSet<http.ClientRequest>();
@@ -57,7 +58,12 @@ export function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel("Claude Usage Bar");
   context.subscriptions.push(outputChannel);
 
-  log("Extension activating (v0.3.1 — diagnostics_channel intercept)");
+  log("Extension activating (v0.3.3 — diagnostics_channel intercept)");
+
+  // Initialize display mode from config (in-memory only after this point)
+  activeDisplayMode = vscode.workspace
+    .getConfiguration("claudeUsageBar")
+    .get<string>("displayMode", "session");
 
   // Restore persisted state
   lastGoodText = context.globalState.get<string>("lastGoodText");
@@ -86,12 +92,9 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("claudeUsageBar.showDetails", () => bootstrapFetch()),
     vscode.commands.registerCommand("claudeUsageBar.refreshRateLimit", () => bootstrapFetch()),
     vscode.commands.registerCommand("claudeUsageBar.switchDisplayMode", () => {
-      const config = vscode.workspace.getConfiguration("claudeUsageBar");
-      const current = config.get<string>("displayMode", "session");
-      const next = current === "session" ? "weekly" : current === "weekly" ? "both" : "session";
-      config.update("displayMode", next, vscode.ConfigurationTarget.Global);
-      vscode.window.setStatusBarMessage(`Claude Usage Bar: showing ${next}`, 3000);
-      updateDisplay();
+      activeDisplayMode = activeDisplayMode === "session" ? "weekly" : activeDisplayMode === "weekly" ? "both" : "session";
+      vscode.window.setStatusBarMessage(`Claude Usage Bar: showing ${activeDisplayMode}`, 3000);
+      updateDisplay(true);
     })
   );
 
@@ -570,12 +573,9 @@ function formatLimitText(
   return text;
 }
 
-function updateDisplay() {
-  const displayMode: string = vscode.workspace
-    .getConfiguration("claudeUsageBar")
-    .get("displayMode", "session");
-  const showSession = displayMode === "session" || displayMode === "both";
-  const showWeekly = displayMode === "weekly" || displayMode === "both";
+function updateDisplay(force = false) {
+  const showSession = activeDisplayMode === "session" || activeDisplayMode === "both";
+  const showWeekly = activeDisplayMode === "weekly" || activeDisplayMode === "both";
 
   const sessionLimit = cachedRateLimit.fiveHour;
   const weeklyLimit =
@@ -585,7 +585,7 @@ function updateDisplay() {
   const hasWeekly = showWeekly && weeklyLimit;
 
   if (!hasSession && !hasWeekly) {
-    if (lastGoodText) return;
+    if (!force && lastGoodText) return;
     rateLimitBarItem.text = "$(check) Usage OK";
     rateLimitBarItem.tooltip = "No active rate limits.\nClick to refresh.";
     rateLimitBarItem.backgroundColor = undefined;
