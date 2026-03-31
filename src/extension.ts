@@ -84,7 +84,15 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("claudeUsageBar.refresh", () => bootstrapFetch()),
     vscode.commands.registerCommand("claudeUsageBar.showDetails", () => bootstrapFetch()),
-    vscode.commands.registerCommand("claudeUsageBar.refreshRateLimit", () => bootstrapFetch())
+    vscode.commands.registerCommand("claudeUsageBar.refreshRateLimit", () => bootstrapFetch()),
+    vscode.commands.registerCommand("claudeUsageBar.switchDisplayMode", () => {
+      const config = vscode.workspace.getConfiguration("claudeUsageBar");
+      const current = config.get<string>("displayMode", "session");
+      const next = current === "session" ? "weekly" : current === "weekly" ? "both" : "session";
+      config.update("displayMode", next, vscode.ConfigurationTarget.Global);
+      vscode.window.setStatusBarMessage(`Claude Usage Bar: showing ${next}`, 3000);
+      updateDisplay();
+    })
   );
 
   // 1. Bootstrap: one API call to get fresh data immediately

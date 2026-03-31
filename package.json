@@ -54,6 +54,10 @@
       {
         "command": "claudeUsageBar.refreshRateLimit",
         "title": "Claude Usage: Refresh Rate Limit"
+      },
+      {
+        "command": "claudeUsageBar.switchDisplayMode",
+        "title": "Claude Usage: Switch Display Mode (Session / Weekly / Both)"
       }
     ]
   },
