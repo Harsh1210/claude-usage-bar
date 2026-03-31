@@ -5,7 +5,7 @@ Shows your **Claude Code rate limit usage** in the VS Code status bar — always
 ## Features
 
 - **Live usage bar** — `S: ████████░░ 92% · 1h 12m` in the status bar
-- **Session (5hr) and weekly (7d) limits** tracked separately
+- **Session (5h) and weekly (7d) limits** tracked separately
 - **Display mode** — choose session, weekly, or both via settings
 - **Color alerts** — yellow at 70%, red at 90%
 - **Reset countdown** — updates every 30 seconds

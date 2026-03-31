@@ -543,8 +543,10 @@ function readDataFile() {
 function formatTimeRemaining(epochSeconds: number): string {
   const diff = Math.floor(epochSeconds - Date.now() / 1000);
   if (diff <= 0) return "soon";
-  const hours = Math.floor(diff / 3600);
+  const days = Math.floor(diff / 86400);
+  const hours = Math.floor((diff % 86400) / 3600);
   const minutes = Math.floor((diff % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h`;
   if (hours > 0) return `${hours}h ${minutes}m`;
   return `${minutes}m`;
 }
@@ -632,7 +634,7 @@ function updateDisplay() {
     const rst = cachedRateLimit.fiveHour.resetsAt
       ? formatTimeRemaining(cachedRateLimit.fiveHour.resetsAt)
       : "?";
-    lines.push(`Session (5hr):  ${pct}%  \u00b7  resets ${rst}`);
+    lines.push(`Session (5h):  ${pct}%  \u00b7  resets ${rst}`);
   }
   if (cachedRateLimit.sevenDay) {
     const pct = Math.floor(cachedRateLimit.sevenDay.utilization * 100);
