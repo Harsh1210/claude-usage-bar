@@ -5,7 +5,7 @@ Shows your **Claude Code rate limit usage** in the VS Code status bar — always
 ## Features
 
 - **Live usage bar** — `S: ████████░░ 92% · 1h 12m` in the status bar
-- **Session (5hr) and weekly (7d) limits** tracked separately
+- **Session (5h) and weekly (7d) limits** tracked separately
 - **Display mode** — choose session, weekly, or both via settings
 - **Color alerts** — yellow at 70%, red at 90%
 - **Reset countdown** — updates every 30 seconds
@@ -50,6 +50,7 @@ For terminal Claude sessions, a `statusLine` script can write rate limit data to
 | Command | Description |
 |---------|-------------|
 | `Claude Usage: Refresh Rate Limit` | Refresh display |
+| `Claude Usage: Switch Display Mode (Session / Weekly / Both)` | Cycle display mode without opening settings |
 
 ## Known Limitations
 
@@ -58,6 +59,19 @@ For terminal Claude sessions, a `statusLine` script can write rate limit data to
 - Usage updates when Claude Code fetches usage data (on panel open/refresh), not on every message
 
 ## Release Notes
+
+### 0.3.3
+
+- **Days in weekly countdown** — reset timer shows `4d 6h` instead of `102h 38m`
+- **Switch Display Mode command** — cycle session/weekly/both from `Cmd+Shift+P` without opening settings
+
+### 0.3.2
+
+- **Background poll** — fetches fresh data every 5 minutes with `Retry-After` backoff on 429
+- **Click to refresh** — clicking the status bar immediately fetches fresh data
+- **Auto-reset expired limits** — usage resets to 0% when the session timer expires
+- **Security fixes** — hardened keychain access, response handling, and backoff logic
+- Handles both 0–1 and 0–100 utilization scales and ISO/epoch `resets_at` timestamps
 
 ### 0.3.1
 
