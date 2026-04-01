@@ -60,6 +60,10 @@ For terminal Claude sessions, a `statusLine` script can write rate limit data to
 
 ## Release Notes
 
+### 0.3.4
+
+- **Persist display mode** — switching display mode via command palette now saves to settings, so it survives VS Code restarts
+
 ### 0.3.3
 
 - **Days in weekly countdown** — reset timer shows `4d 6h` instead of `102h 38m`
