@@ -8,7 +8,7 @@ import * as diagnostics_channel from "diagnostics_channel";
 import { execFileSync } from "child_process";
 
 /**
- * Claude Usage Bar v0.3.1
+ * Claude Usage Bar v0.3.3
  *
  * How it works:
  * Uses Node.js diagnostics_channel to passively observe ALL HTTP requests
@@ -42,6 +42,7 @@ let cachedRateLimit: RateLimitInfo = {};
 let lastGoodText: string | undefined;
 let lastGoodTooltip: string | undefined;
 let extensionContext: vscode.ExtensionContext;
+let activeDisplayMode: string = "session";
 let outputChannel: vscode.OutputChannel;
 // Track requests to /api/oauth/usage so we can tap their responses
 const pendingUsageRequests = new WeakSet<http.ClientRequest>();
@@ -57,7 +58,12 @@ export function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel("Claude Usage Bar");
   context.subscriptions.push(outputChannel);
 
-  log("Extension activating (v0.3.1 — diagnostics_channel intercept)");
+  log("Extension activating (v0.3.3 — diagnostics_channel intercept)");
+
+  // Initialize display mode from config (in-memory only after this point)
+  activeDisplayMode = vscode.workspace
+    .getConfiguration("claudeUsageBar")
+    .get<string>("displayMode", "session");
 
   // Restore persisted state
   lastGoodText = context.globalState.get<string>("lastGoodText");
@@ -84,7 +90,12 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("claudeUsageBar.refresh", () => bootstrapFetch()),
     vscode.commands.registerCommand("claudeUsageBar.showDetails", () => bootstrapFetch()),
-    vscode.commands.registerCommand("claudeUsageBar.refreshRateLimit", () => bootstrapFetch())
+    vscode.commands.registerCommand("claudeUsageBar.refreshRateLimit", () => bootstrapFetch()),
+    vscode.commands.registerCommand("claudeUsageBar.switchDisplayMode", () => {
+      activeDisplayMode = activeDisplayMode === "session" ? "weekly" : activeDisplayMode === "weekly" ? "both" : "session";
+      vscode.window.setStatusBarMessage(`Claude Usage Bar: showing ${activeDisplayMode}`, 3000);
+      updateDisplay(true);
+    })
   );
 
   // 1. Bootstrap: one API call to get fresh data immediately
@@ -535,8 +546,10 @@ function readDataFile() {
 function formatTimeRemaining(epochSeconds: number): string {
   const diff = Math.floor(epochSeconds - Date.now() / 1000);
   if (diff <= 0) return "soon";
-  const hours = Math.floor(diff / 3600);
+  const days = Math.floor(diff / 86400);
+  const hours = Math.floor((diff % 86400) / 3600);
   const minutes = Math.floor((diff % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h`;
   if (hours > 0) return `${hours}h ${minutes}m`;
   return `${minutes}m`;
 }
@@ -560,12 +573,9 @@ function formatLimitText(
   return text;
 }
 
-function updateDisplay() {
-  const displayMode: string = vscode.workspace
-    .getConfiguration("claudeUsageBar")
-    .get("displayMode", "session");
-  const showSession = displayMode === "session" || displayMode === "both";
-  const showWeekly = displayMode === "weekly" || displayMode === "both";
+function updateDisplay(force = false) {
+  const showSession = activeDisplayMode === "session" || activeDisplayMode === "both";
+  const showWeekly = activeDisplayMode === "weekly" || activeDisplayMode === "both";
 
   const sessionLimit = cachedRateLimit.fiveHour;
   const weeklyLimit =
@@ -575,7 +585,7 @@ function updateDisplay() {
   const hasWeekly = showWeekly && weeklyLimit;
 
   if (!hasSession && !hasWeekly) {
-    if (lastGoodText) return;
+    if (!force && lastGoodText) return;
     rateLimitBarItem.text = "$(check) Usage OK";
     rateLimitBarItem.tooltip = "No active rate limits.\nClick to refresh.";
     rateLimitBarItem.backgroundColor = undefined;
@@ -624,7 +634,7 @@ function updateDisplay() {
     const rst = cachedRateLimit.fiveHour.resetsAt
       ? formatTimeRemaining(cachedRateLimit.fiveHour.resetsAt)
       : "?";
-    lines.push(`Session (5hr):  ${pct}%  \u00b7  resets ${rst}`);
+    lines.push(`Session (5h):  ${pct}%  \u00b7  resets ${rst}`);
   }
   if (cachedRateLimit.sevenDay) {
     const pct = Math.floor(cachedRateLimit.sevenDay.utilization * 100);
