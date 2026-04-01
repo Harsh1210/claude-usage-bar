@@ -8,7 +8,7 @@ import * as diagnostics_channel from "diagnostics_channel";
 import { execFileSync } from "child_process";
 
 /**
- * Claude Usage Bar v0.3.3
+ * Claude Usage Bar v0.3.4
  *
  * How it works:
  * Uses Node.js diagnostics_channel to passively observe ALL HTTP requests
@@ -58,7 +58,7 @@ export function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel("Claude Usage Bar");
   context.subscriptions.push(outputChannel);
 
-  log("Extension activating (v0.3.3 — diagnostics_channel intercept)");
+  log("Extension activating (v0.3.4 — diagnostics_channel intercept)");
 
   // Initialize display mode from config (in-memory only after this point)
   activeDisplayMode = vscode.workspace
@@ -93,6 +93,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("claudeUsageBar.refreshRateLimit", () => bootstrapFetch()),
     vscode.commands.registerCommand("claudeUsageBar.switchDisplayMode", () => {
       activeDisplayMode = activeDisplayMode === "session" ? "weekly" : activeDisplayMode === "weekly" ? "both" : "session";
+      vscode.workspace.getConfiguration("claudeUsageBar").update("displayMode", activeDisplayMode, vscode.ConfigurationTarget.Global);
       vscode.window.setStatusBarMessage(`Claude Usage Bar: showing ${activeDisplayMode}`, 3000);
       updateDisplay(true);
     })
