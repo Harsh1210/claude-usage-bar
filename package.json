@@ -2,7 +2,7 @@
   "name": "claude-usage-bar",
   "displayName": "Claude Usage Bar",
   "description": "Shows your Claude Code rate limit usage in the VS Code status bar via statusLine integration — session %, reset countdown, and color alerts. Zero API calls.",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "publisher": "HarshAgarwal1012",
   "repository": {
     "type": "git",
@@ -39,6 +39,11 @@
             "Show both session and weekly limits"
           ],
           "description": "Which rate limit to display in the status bar"
+        },
+        "claudeUsageBar.showProgressBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a visual progress bar next to the percentage. Disable for a compact text-only display (e.g. 'S: 92% · 1h 12m')."
         }
       }
     },
