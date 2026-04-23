@@ -8,7 +8,7 @@ import * as diagnostics_channel from "diagnostics_channel";
 import { execFileSync } from "child_process";
 
 /**
- * Claude Usage Bar v0.3.4
+ * Claude Usage Bar v0.3.5
  *
  * How it works:
  * Uses Node.js diagnostics_channel to passively observe ALL HTTP requests
@@ -58,7 +58,7 @@ export function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel("Claude Usage Bar");
   context.subscriptions.push(outputChannel);
 
-  log("Extension activating (v0.3.4 — diagnostics_channel intercept)");
+  log("Extension activating (v0.3.5 — diagnostics_channel intercept)");
 
   // Initialize display mode from config (in-memory only after this point)
   activeDisplayMode = vscode.workspace
@@ -559,7 +559,10 @@ function formatBar(utilPct: number): string {
   const barLength = 10;
   const filled = Math.round((utilPct / 100) * barLength);
   const empty = barLength - filled;
-  return "\u2588".repeat(filled) + "\u2591".repeat(empty);
+  // Circles render distinctly in the VS Code status-bar UI font on every
+  // platform. The prior block chars (U+2588/U+2591) looked identical in
+  // macOS SF Pro, making the bar unreadable. (#6)
+  return "\u25CF".repeat(filled) + "\u25CB".repeat(empty);
 }
 
 function formatLimitText(
@@ -569,7 +572,12 @@ function formatLimitText(
 ): string {
   const pct = Math.floor(utilization * 100);
   const resetStr = resetsAt ? formatTimeRemaining(resetsAt) : "";
-  let text = `${label} ${formatBar(pct)} ${pct}%`;
+  const showBar = vscode.workspace
+    .getConfiguration("claudeUsageBar")
+    .get<boolean>("showProgressBar", true);
+  let text = showBar
+    ? `${label} ${formatBar(pct)} ${pct}%`
+    : `${label} ${pct}%`;
   if (resetStr) text += ` \u00b7 ${resetStr}`;
   return text;
 }
