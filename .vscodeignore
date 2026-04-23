@@ -2,3 +2,7 @@ src/
 node_modules/
 tsconfig.json
 .vscode/
+.agents/
+.kiro/
+skills-lock.json
+**/.git/
